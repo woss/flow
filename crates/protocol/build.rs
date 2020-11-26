@@ -38,6 +38,16 @@ struct TypeAttrs<'a> {
 /// `field_attrs` holds tuples of field name to field attributes.
 static TYPE_ATTRS: &'static [TypeAttrs<'static>] = &[
     TypeAttrs {
+        path: "protocol.Route",
+        type_attrs: SERDE_ATTR,
+        field_attrs: &[],
+    },
+    TypeAttrs {
+        path: "protocol.ProcessSpec.ID",
+        type_attrs: SERDE_ATTR,
+        field_attrs: &[],
+    },
+    TypeAttrs {
         path: "protocol.Label",
         type_attrs: SERDE_ATTR,
         field_attrs: &[],

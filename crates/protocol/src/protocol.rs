@@ -181,7 +181,8 @@ pub struct ProcessSpec {
 }
 pub mod process_spec {
     /// ID composes a zone and a suffix to uniquely identify a ProcessSpec.
-    #[derive(Clone, PartialEq, ::prost::Message)]
+    #[derive(Clone, PartialEq, ::prost::Message, serde::Deserialize, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
     pub struct Id {
         /// "Zone" in which the process is running. Zones may be AWS, Azure, or
         /// Google Cloud Platform zone identifiers, or rack locations within a colo,
@@ -627,7 +628,8 @@ pub mod fragments_response {
     }
 }
 /// Route captures the current topology of an item and the processes serving it.
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Route {
     /// Members of the Route, ordered on ascending ProcessSpec.ID (zone, suffix).
     #[prost(message, repeated, tag = "1")]

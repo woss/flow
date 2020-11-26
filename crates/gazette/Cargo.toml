@@ -1,0 +1,28 @@
+[package]
+name = "gazette"
+version = "0.0.0"
+authors = ["Estuary Technologies, Inc"]
+edition = "2018"
+
+[dependencies]
+protocol = { path = "../protocol", version = "0.0.0" }
+
+bytes = "*"
+futures = "*"
+itertools = "*"
+log = "*"
+prost = "*"
+tempfile = "*"
+thiserror = "*"
+tokio = { version = "0.2", features = ["full"] }
+tonic = { version = "*" }
+tinyvec = {version = "*", features = ["alloc", "rustc_1_40"]}
+tower = "*"
+tracing = "*"
+http = "*"
+hyper = "*"
+
+[dev-dependencies]
+insta = "*"
+tracing-subscriber = "*"
+serde_json = "*"

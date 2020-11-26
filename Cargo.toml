@@ -11,4 +11,7 @@ incremental = true
 debug = 0 # Set this to 1 or 2 to get more useful backtraces in debugger.
 
 [patch.'crates-io']
-# rowan = { path = "../rowan" }
+tonic = { path = "../tonic/tonic" }
+#tonic-types = { path = "../tonic/tonic-types" }
+#tonic-build = { path = "../tonic/tonic-build" }
+#tonic-health = { path = "../tonic/tonic-health" }
