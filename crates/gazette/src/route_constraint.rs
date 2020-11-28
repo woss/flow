@@ -16,12 +16,12 @@ pub enum RouteConstraint<'a> {
     Fixed(&'a str),
 }
 
-/// Router maps from an item to a matched Route, or None.
-pub trait Router {
+/// ItemRouter maps from an item to a matched Route, or None.
+pub trait ItemRouter {
     fn route<'a>(&'a self, item: &str) -> Option<&'a protocol::Route>;
 }
 
-impl<K, V, S> Router for std::collections::HashMap<K, V, S>
+impl<K, V, S> ItemRouter for std::collections::HashMap<K, V, S>
 where
     K: Borrow<str> + Eq + std::hash::Hash,
     V: Borrow<protocol::Route>,
@@ -53,7 +53,11 @@ impl<'a> RouteConstraint<'a> {
     /// Though there isn't an exact match, we certainly want to pick
     /// among the 'gcp-us-central1-*" zones. If we *had* an exact zone
     /// match, we'd prefer that above all others.
-    pub fn pick_candidates<'s, R: Router>(&'s self, router: &'a R, zone: &str) -> ArrayVec<B<'a>> {
+    pub fn pick_candidates<'s, R: ItemRouter>(
+        &'s self,
+        router: &'a R,
+        zone: &str,
+    ) -> ArrayVec<B<'a>> {
         let route = match self {
             RouteConstraint::Default => return array_vec!(B),
             RouteConstraint::ItemAny(key) | RouteConstraint::ItemPrimary(key) => {
@@ -110,7 +114,7 @@ impl<'a> RouteConstraint<'a> {
 
 #[cfg(test)]
 mod test {
-    use super::{common_prefix, protocol::Route, RouteConstraint, Router, B};
+    use super::{common_prefix, protocol::Route, ItemRouter, RouteConstraint, B};
     use serde_json::json;
     use tinyvec::array_vec;
 

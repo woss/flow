@@ -1,10 +1,13 @@
-use super::{RouteConstraint, Router};
+use super::{ItemRouter, RouteConstraint};
+use futures::channel::oneshot;
+use futures::FutureExt;
 use protocol::protocol::{self as broker, journal_client::JournalClient};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 use tonic::transport::{channel::Connection, Endpoint};
-use tower::{Service, ServiceExt};
+use tower::Service;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -14,74 +17,135 @@ pub enum Error {
     InvalidUri(#[from] http::uri::InvalidUri),
 }
 
-struct Dispatcher<R: Router> {
-    zone: String,
+/// Dispatcher manages transports to a dynamic set of endpoints, where
+/// endpoints are discovered from observed protocol::Routes. It provides a
+/// means for converting a RouteConstraint into a tower::Service that
+/// dispatches the request to an endpoint that satisfies the constraint.
+pub struct Dispatcher<R> {
     router: R,
-    default: String,
-    connections: HashMap<String, (Option<(String, Connection, u8)>, Vec<Waker>)>,
+    // Preferred zone to which we'll dispatch.
+    local_zone: String,
+    // Address of last resort (eg, a Kubernetes service).
+    default_address: String,
+    // Mark set on endpoints as they're used.
+    // A sweep will clear idle endpoints (not having the active mark).
     active_mark: u8,
+    // Map from address => (address + Connection + mark, wakers).
+    // The extra address copy is passed to the caller on checkout,
+    // and allows for returning the endpoint with allocating a new String.
+    endpoints: HashMap<String, (Option<(String, Connection, u8)>, Vec<Waker>)>,
+    // Signals periodic_sweeps() on Drop.
+    _tx_drop: oneshot::Sender<()>,
 }
 
 impl<R> Dispatcher<R>
 where
-    R: Router,
+    R: ItemRouter + Send + 'static,
 {
-    // Poll for an endpoint and ready Connection that satisfies the RouteConstraint.
+    /// Start a Dispatcher serving from the given zone, with the given default
+    /// address. The provided ItemRouter is used to map RouteConstraints to
+    /// addresses, and is the means by which the Dispatcher discovers new
+    /// service endpoints.
+    ///
+    /// Unused endpoints are periodically swept, using the provided interval.
+    pub fn start(
+        zone: &str,
+        address: &str,
+        router: R,
+        sweep: Duration,
+    ) -> Arc<Mutex<Dispatcher<R>>> {
+        let (tx_drop, rx_drop) = oneshot::channel();
+
+        let d = Dispatcher {
+            router,
+            local_zone: zone.to_string(),
+            default_address: address.to_string(),
+            active_mark: 1,
+            endpoints: HashMap::new(),
+            _tx_drop: tx_drop,
+        };
+        let d = Arc::new(Mutex::new(d));
+
+        tokio::spawn(Self::periodic_sweeps(sweep, Arc::downgrade(&d), rx_drop));
+
+        d
+    }
+
+    /// Obtain mutable access to the Dispatcher's ItemRouter.
+    pub fn router(&mut self) -> &mut R {
+        &mut self.router
+    }
+
+    /// Bind this Dispatcher to a RouteConstraint, returning a Binding that
+    /// implements tower::Service, and to which Requests may be dispatched.
+    pub fn bind<'a>(
+        dispatcher: Arc<Mutex<Self>>,
+        constraint: RouteConstraint<'a>,
+    ) -> Binding<'a, R> {
+        Binding {
+            dispatcher,
+            constraint,
+            ready: None,
+        }
+    }
+
+    // Poll for a ready endpoint that satisfies a RouteConstraint.
     fn poll_endpoint<'a>(
         &'a mut self,
         cx: &mut Context<'_>,
         constraint: &'a RouteConstraint,
     ) -> Poll<Result<(String, Connection), Error>> {
         let Dispatcher {
-            zone,
+            local_zone,
             router,
-            default,
-            connections,
+            default_address,
+            endpoints,
             active_mark,
+            ..
         } = self;
 
-        // Identify endpoint candidates for the RouteConstraint.
-        let mut candidates = constraint.pick_candidates(router, zone);
-        if candidates.is_empty() {
-            candidates.push(default);
+        // Identify address candidates for the RouteConstraint.
+        let mut addresses = constraint.pick_candidates(router, local_zone);
+        if addresses.is_empty() {
+            addresses.push(default_address);
         }
 
-        // Walk each, starting or polling for a ready connection.
-        for ep in candidates {
-            // If this endpoint is unknown, start a new connection.
-            if !connections.contains_key(ep) {
-                tracing::debug!(endpoint = ep, "starting connection");
+        // Walk each, starting or polling for a ready endpoint.
+        for addr in addresses {
+            // If this endpoint is unknown, start it.
+            if !endpoints.contains_key(addr) {
+                tracing::debug!(addr, "starting endpoint");
 
-                let conn = match Endpoint::from_shared(ep.to_string()) {
+                let conn = match Endpoint::from_shared(addr.to_string()) {
                     Ok(ep) => ep.transport_lazy(),
                     Err(err) => return Poll::Ready(Err(err.into())),
                 };
 
-                connections.insert(
-                    ep.to_string(),
-                    (Some((ep.to_string(), conn, 0)), Vec::new()),
+                endpoints.insert(
+                    addr.to_string(),
+                    (Some((addr.to_string(), conn, 0)), Vec::new()),
                 );
             }
 
-            let (slot, notify) = connections.get_mut(ep).unwrap();
+            let (slot, notify) = endpoints.get_mut(addr).unwrap();
             match slot.take() {
-                Some((ep, mut conn, _)) => match conn.poll_ready(cx) {
+                Some((addr, mut conn, _)) => match conn.poll_ready(cx) {
                     Poll::Ready(Ok(())) => {
-                        tracing::trace!(endpoint = %ep, "connection ready");
-                        return Poll::Ready(Ok((ep, conn)));
+                        tracing::trace!(%addr, "endpoint ready");
+                        return Poll::Ready(Ok((addr, conn)));
                     }
                     Poll::Ready(Err(err)) => {
-                        tracing::trace!(endpoint = %ep, err = %err, "connection failed");
+                        tracing::trace!(%addr, %err, "endpoint failed");
                         return Poll::Ready(Err(Error::Transport(err)));
                     }
                     Poll::Pending => {
-                        tracing::trace!(endpoint = %ep, "polled connection to pending");
-                        *slot = Some((ep, conn, *active_mark));
+                        tracing::trace!(%addr, "polled endpoint to pending");
+                        *slot = Some((addr, conn, *active_mark));
                         notify.push(cx.waker().clone());
                     }
                 },
                 None => {
-                    tracing::trace!(endpoint = %ep, "connection is checked out");
+                    tracing::trace!(%addr, "endpoint already checked out");
                     notify.push(cx.waker().clone());
                 }
             }
@@ -89,51 +153,88 @@ where
         Poll::Pending
     }
 
-    fn return_connection(&mut self, ep: String, conn: Connection) {
-        let (slot, notify) = self.connections.get_mut(&ep).unwrap();
+    // Return a checked-out endpoint to the Dispatcher.
+    fn check_in(&mut self, addr: String, conn: Connection) {
+        tracing::trace!(%addr, "checked in endpoint");
+        let (slot, notify) = self.endpoints.get_mut(&addr).unwrap();
         if slot.is_some() {
-            panic!("returned connection not checked out");
+            panic!("checked-in endpoint is not checked out");
         }
-        *slot = Some((ep, conn, self.active_mark));
+        *slot = Some((addr, conn, self.active_mark));
         notify.drain(..).for_each(Waker::wake);
     }
 
-    // Sweep connections which haven't been used since the last sweep,
-    // and increase the marking value.git push --set-upstream origin gazette
-    fn sweep(&mut self) {
-        /*
-        let verify = self.active_mark;
-        self.active_mark += 1;
+    // Sweep endpoints which haven't been used since the last sweep.
+    #[tracing::instrument(skip(dispatcher, rx_drop))]
+    async fn periodic_sweeps(
+        interval: Duration,
+        dispatcher: Weak<Mutex<Dispatcher<R>>>,
+        rx_drop: futures::channel::oneshot::Receiver<()>,
+    ) {
+        tracing::debug!("started periodic sweeps");
 
-        self.connections.retain(|_, dc| match dc {
-            DispatchConn::CheckedIn { endpoint, mark, .. } if *mark != verify => {
-                tracing::debug!(endpoint = %endpoint, "sweeping unused connection");
-                falsegit push --set-upstream origin gazette
-            }
-            _ => true,
-        });
-        */
+        // Start an interval ticker. The first tick is immediate; ignore it.
+        let mut interval = tokio::time::interval(interval);
+        let _ = interval.tick().await;
+
+        // Pin & fuse for re-entrant select!.
+        futures::pin_mut!(rx_drop);
+        let mut rx_drop = rx_drop.fuse();
+
+        loop {
+            // Select over the next tick OR rx_drop.
+            let tick = interval.tick();
+            futures::pin_mut!(tick);
+
+            futures::select!(
+                _ = tick.fuse() => (),
+                _ = rx_drop => (),
+            );
+
+            let d = dispatcher.upgrade(); // Weak => Arc.
+            let d = match d {
+                None => {
+                    tracing::debug!("dispatcher dropped");
+                    return;
+                }
+                Some(d) => d,
+            };
+            let mut d = d.lock().unwrap(); // Mutex => MutexGuard.
+
+            let verify = d.active_mark;
+            d.active_mark += 1;
+
+            d.endpoints.retain(|_, (ep, _)| match ep {
+                Some((addr, _, mark)) if *mark != verify => {
+                    tracing::debug!(%addr, "sweeping unused endpoint");
+                    false
+                }
+                _ => true,
+            });
+        }
     }
 }
 
-struct Binding<'a, R>
+/// Binding combines a Dispatcher with a RouteConstraint, and applies the
+/// constraint to the Dispatcher in order to implement a tower::Service.
+pub struct Binding<'a, R>
 where
-    R: Router + 'a,
+    R: ItemRouter + Send + 'static,
 {
     dispatcher: Arc<Mutex<Dispatcher<R>>>,
     constraint: RouteConstraint<'a>,
     ready: Option<(String, Connection)>,
 }
 
-type Request = http::Request<tonic::body::BoxBody>;
+type HttpRequest = http::Request<tonic::body::BoxBody>;
 
-impl<'a, R> Service<Request> for Binding<'a, R>
+impl<'a, R> Service<HttpRequest> for Binding<'a, R>
 where
-    R: Router + 'a,
+    R: ItemRouter + Send + 'static,
 {
-    type Response = <Connection as Service<Request>>::Response;
-    type Error = <Connection as Service<Request>>::Error;
-    type Future = <Connection as Service<Request>>::Future;
+    type Response = <Connection as Service<HttpRequest>>::Response;
+    type Error = <Connection as Service<HttpRequest>>::Error;
+    type Future = <Connection as Service<HttpRequest>>::Future;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let mut guard = self.dispatcher.lock().unwrap();
@@ -148,10 +249,10 @@ where
         }
     }
 
-    fn call(&mut self, req: Request) -> Self::Future {
+    fn call(&mut self, req: HttpRequest) -> Self::Future {
         let (ep, mut conn) = self.ready.take().expect("not ready");
         let fut = conn.call(req);
-        self.dispatcher.lock().unwrap().return_connection(ep, conn);
+        self.dispatcher.lock().unwrap().check_in(ep, conn);
         fut
     }
 }
@@ -161,11 +262,8 @@ async fn do_the_thing(
     index: usize,
     dispatcher: Arc<Mutex<Dispatcher<HashMap<String, broker::Route>>>>,
 ) {
-    let binding = Binding {
-        dispatcher,
-        constraint: RouteConstraint::ItemAny("foobar"),
-        ready: None,
-    };
+    let constraint = RouteConstraint::ItemAny("foobar");
+    let binding = Dispatcher::bind(dispatcher, constraint);
 
     let mut jc = JournalClient::new(binding);
 
@@ -180,31 +278,6 @@ async fn do_the_thing(
 
     let status = resp.into_inner().status;
     tracing::info!(status = status, "got response");
-
-    /*
-
-    let ep = Endpoint::from_static("http://localhost:8080");
-    let mut conn = ep.transport_lazy();
-
-    let os = conn.ready_oneshot();
-    {
-        let _guard = tracing::span!(tracing::Level::TRACE, "connecting");
-        conn = os.await.expect("failed to connect");
-    }
-
-    let mut jc = JournalClient::new(conn);
-
-    let resp = jc
-        .list(broker::ListRequest {
-            selector: Some(broker::LabelSelector {
-                ..Default::default()
-            }),
-        })
-        .await
-        .expect("no failure");
-
-    tracing::info!(?resp);
-    */
 }
 
 #[cfg(test)]
@@ -230,14 +303,12 @@ mod tests {
 
         let router: HashMap<String, broker::Route> = HashMap::new();
 
-        let dispatcher = Dispatcher {
-            zone: "us-central1-c".to_string(),
+        let dispatcher = Dispatcher::start(
+            "us-central1-c",
+            "http://localhost:8080",
             router,
-            default: "http://localhost:8080".to_owned(),
-            connections: HashMap::new(),
-            active_mark: 1,
-        };
-        let dispatcher = Arc::new(Mutex::new(dispatcher));
+            Duration::from_secs(1),
+        );
 
         let h1 = tokio::spawn(do_the_thing(1, dispatcher.clone()));
         let h2 = tokio::spawn(do_the_thing(2, dispatcher.clone()));
@@ -247,20 +318,3 @@ mod tests {
         tracing::info!(response = ?r, "all done");
     }
 }
-
-/*
-#[derive(Clone, Hash, Eq, PartialEq, Default)]
-struct ProcessId {
-    zone: String,
-    suffix: String,
-}
-
-impl From<broker::process_spec::Id> for ProcessId {
-    fn from(s: broker::process_spec::Id) -> Self {
-        Self {
-            zone: s.zone,
-            suffix: s.suffix,
-        }
-    }
-}
-*/

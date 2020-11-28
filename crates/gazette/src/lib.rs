@@ -1,4 +1,5 @@
 mod route_constraint;
-pub use route_constraint::{RouteConstraint, Router};
+pub use route_constraint::{ItemRouter, RouteConstraint};
 
-pub mod dispatch;
+mod dispatch;
+pub use dispatch::Dispatcher;
