@@ -1,7 +1,8 @@
-use super::RouteConstraint;
+use super::{RouteConstraint, Router};
 use protocol::protocol::{self as broker, journal_client::JournalClient};
 use std::collections::HashMap;
-use std::task::{Context, Poll};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 use tonic::transport::{channel::Connection, Endpoint};
 use tower::{Service, ServiceExt};
 
@@ -13,25 +14,20 @@ pub enum Error {
     InvalidUri(#[from] http::uri::InvalidUri),
 }
 
-trait ItemRouter {
-    fn route<'s>(&'s self, item: &str) -> Option<&'s broker::Route>;
-}
-
-struct Dispatcher<R> {
+struct Dispatcher<R: Router> {
     zone: String,
     router: R,
     default: String,
-
-    connections: HashMap<String, (Connection, u8)>,
-    mark: u8,
+    connections: HashMap<String, (Option<(String, Connection, u8)>, Vec<Waker>)>,
+    active_mark: u8,
 }
 
-impl<'a, R> Dispatcher<R>
+impl<R> Dispatcher<R>
 where
-    R: Fn(&str) -> Option<&'a broker::Route>,
+    R: Router,
 {
     // Poll for an endpoint and ready Connection that satisfies the RouteConstraint.
-    fn poll_endpoint(
+    fn poll_endpoint<'a>(
         &'a mut self,
         cx: &mut Context<'_>,
         constraint: &'a RouteConstraint,
@@ -41,7 +37,7 @@ where
             router,
             default,
             connections,
-            mark,
+            active_mark,
         } = self;
 
         // Identify endpoint candidates for the RouteConstraint.
@@ -52,62 +48,97 @@ where
 
         // Walk each, starting or polling for a ready connection.
         for ep in candidates {
-            let (ep, mut conn) = match connections.remove_entry(ep) {
+            // If this endpoint is unknown, start a new connection.
+            if !connections.contains_key(ep) {
+                tracing::debug!(endpoint = ep, "starting connection");
+
+                let conn = match Endpoint::from_shared(ep.to_string()) {
+                    Ok(ep) => ep.transport_lazy(),
+                    Err(err) => return Poll::Ready(Err(err.into())),
+                };
+
+                connections.insert(
+                    ep.to_string(),
+                    (Some((ep.to_string(), conn, 0)), Vec::new()),
+                );
+            }
+
+            let (slot, notify) = connections.get_mut(ep).unwrap();
+            match slot.take() {
+                Some((ep, mut conn, _)) => match conn.poll_ready(cx) {
+                    Poll::Ready(Ok(())) => {
+                        tracing::trace!(endpoint = %ep, "connection ready");
+                        return Poll::Ready(Ok((ep, conn)));
+                    }
+                    Poll::Ready(Err(err)) => {
+                        tracing::trace!(endpoint = %ep, err = %err, "connection failed");
+                        return Poll::Ready(Err(Error::Transport(err)));
+                    }
+                    Poll::Pending => {
+                        tracing::trace!(endpoint = %ep, "polled connection to pending");
+                        *slot = Some((ep, conn, *active_mark));
+                        notify.push(cx.waker().clone());
+                    }
+                },
                 None => {
-                    tracing::debug!(endpoint = ep, "starting connection");
-
-                    let conn = match Endpoint::from_shared(ep.to_string()) {
-                        Ok(ep) => ep.transport_lazy(),
-                        Err(err) => return Poll::Ready(Err(err.into())),
-                    };
-                    (ep.to_string(), conn)
+                    tracing::trace!(endpoint = %ep, "connection is checked out");
+                    notify.push(cx.waker().clone());
                 }
-                Some((ep, (conn, _))) => (ep, conn),
-            };
-
-            match conn.poll_ready(cx) {
-                Poll::Pending => {
-                    connections.insert(ep, (conn, *mark));
-                }
-                Poll::Ready(Ok(())) => return Poll::Ready(Ok((ep, conn))),
-                Poll::Ready(Err(err)) => return Poll::Ready(Err(Error::Transport(err))),
             }
         }
-
         Poll::Pending
     }
 
     fn return_connection(&mut self, ep: String, conn: Connection) {
-        self.connections.insert(ep, (conn, self.mark));
+        let (slot, notify) = self.connections.get_mut(&ep).unwrap();
+        if slot.is_some() {
+            panic!("returned connection not checked out");
+        }
+        *slot = Some((ep, conn, self.active_mark));
+        notify.drain(..).for_each(Waker::wake);
     }
 
     // Sweep connections which haven't been used since the last sweep,
-    // and increase the marking value.
+    // and increase the marking value.git push --set-upstream origin gazette
     fn sweep(&mut self) {
-        let m = self.mark;
-        self.connections.retain(|k, (_, mark)| *mark == m);
-        self.mark += 1;
+        /*
+        let verify = self.active_mark;
+        self.active_mark += 1;
+
+        self.connections.retain(|_, dc| match dc {
+            DispatchConn::CheckedIn { endpoint, mark, .. } if *mark != verify => {
+                tracing::debug!(endpoint = %endpoint, "sweeping unused connection");
+                falsegit push --set-upstream origin gazette
+            }
+            _ => true,
+        });
+        */
     }
 }
 
-struct Binding<'a, R> {
-    dispatcher: &'a mut Dispatcher<R>,
+struct Binding<'a, R>
+where
+    R: Router + 'a,
+{
+    dispatcher: Arc<Mutex<Dispatcher<R>>>,
     constraint: RouteConstraint<'a>,
     ready: Option<(String, Connection)>,
 }
 
 type Request = http::Request<tonic::body::BoxBody>;
 
-impl<'c, Router> Service<Request> for Binding<'c, Router>
+impl<'a, R> Service<Request> for Binding<'a, R>
 where
-    Router: Fn(&str) -> Option<&broker::Route>,
+    R: Router + 'a,
 {
     type Response = <Connection as Service<Request>>::Response;
     type Error = <Connection as Service<Request>>::Error;
     type Future = <Connection as Service<Request>>::Future;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        match self.dispatcher.poll_endpoint(cx, &mut self.constraint) {
+        let mut guard = self.dispatcher.lock().unwrap();
+
+        match guard.poll_endpoint(cx, &mut self.constraint) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(err)) => Poll::Ready(Err(err.into())),
             Poll::Ready(Ok((ep, conn))) => {
@@ -120,24 +151,18 @@ where
     fn call(&mut self, req: Request) -> Self::Future {
         let (ep, mut conn) = self.ready.take().expect("not ready");
         let fut = conn.call(req);
-        self.dispatcher.return_connection(ep, conn);
+        self.dispatcher.lock().unwrap().return_connection(ep, conn);
         fut
     }
 }
 
-async fn do_the_thing() {
-    let router /*: Fn(&str) -> Option<&broker::Route>*/ = |_| None;
-
-    let mut dispatcher = Dispatcher {
-        zone: "us-central1-c".to_string(),
-        router,
-        default: "http://localhost:8080".to_owned(),
-        connections: HashMap::new(),
-        mark: 1,
-    };
-
+#[tracing::instrument(skip(dispatcher))]
+async fn do_the_thing(
+    index: usize,
+    dispatcher: Arc<Mutex<Dispatcher<HashMap<String, broker::Route>>>>,
+) {
     let binding = Binding {
-        dispatcher: &mut dispatcher,
+        dispatcher,
         constraint: RouteConstraint::ItemAny("foobar"),
         ready: None,
     };
@@ -153,7 +178,8 @@ async fn do_the_thing() {
         .await
         .expect("no failure");
 
-    tracing::info!(?resp);
+    let status = resp.into_inner().status;
+    tracing::info!(status = status, "got response");
 
     /*
 
@@ -202,7 +228,23 @@ mod tests {
         tracing::warn!("warn");
         tracing::error!("error");
 
-        do_the_thing().await;
+        let router: HashMap<String, broker::Route> = HashMap::new();
+
+        let dispatcher = Dispatcher {
+            zone: "us-central1-c".to_string(),
+            router,
+            default: "http://localhost:8080".to_owned(),
+            connections: HashMap::new(),
+            active_mark: 1,
+        };
+        let dispatcher = Arc::new(Mutex::new(dispatcher));
+
+        let h1 = tokio::spawn(do_the_thing(1, dispatcher.clone()));
+        let h2 = tokio::spawn(do_the_thing(2, dispatcher.clone()));
+        let h3 = tokio::spawn(do_the_thing(3, dispatcher.clone()));
+
+        let r = futures::try_join!(h1, h2, h3);
+        tracing::info!(response = ?r, "all done");
     }
 }
 

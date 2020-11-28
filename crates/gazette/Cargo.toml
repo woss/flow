@@ -19,6 +19,7 @@ tonic = { version = "*" }
 tinyvec = {version = "*", features = ["alloc", "rustc_1_40"]}
 tower = "*"
 tracing = "*"
+tracing-futures = "*"
 http = "*"
 hyper = "*"
 

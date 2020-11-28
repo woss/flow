@@ -991,6 +991,7 @@ dependencies = [
  "tonic",
  "tower",
  "tracing",
+ "tracing-futures",
  "tracing-subscriber",
 ]
 

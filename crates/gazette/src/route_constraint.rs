@@ -1,4 +1,5 @@
 use protocol::protocol;
+use std::borrow::Borrow;
 use tinyvec::{array_vec, ArrayVec};
 
 /// RouteConstraint constrains how a request may be dispatched among members.
@@ -13,6 +14,22 @@ pub enum RouteConstraint<'a> {
     Route(&'a protocol::Route),
     /// Dispatch to a fixed endpoint.
     Fixed(&'a str),
+}
+
+/// Router maps from an item to a matched Route, or None.
+pub trait Router {
+    fn route<'a>(&'a self, item: &str) -> Option<&'a protocol::Route>;
+}
+
+impl<K, V, S> Router for std::collections::HashMap<K, V, S>
+where
+    K: Borrow<str> + Eq + std::hash::Hash,
+    V: Borrow<protocol::Route>,
+    S: std::hash::BuildHasher,
+{
+    fn route<'a>(&'a self, item: &str) -> Option<&'a protocol::Route> {
+        self.get(item).map(Borrow::borrow)
+    }
 }
 
 impl<'a> RouteConstraint<'a> {
@@ -36,25 +53,24 @@ impl<'a> RouteConstraint<'a> {
     /// Though there isn't an exact match, we certainly want to pick
     /// among the 'gcp-us-central1-*" zones. If we *had* an exact zone
     /// match, we'd prefer that above all others.
-    pub fn pick_candidates<'s, R>(&'s self, route: R, zone: &str) -> ArrayVec<B<'a>>
-    where
-        R: FnOnce(&'s str) -> Option<&'a protocol::Route>,
-    {
+    pub fn pick_candidates<'s, R: Router>(&'s self, router: &'a R, zone: &str) -> ArrayVec<B<'a>> {
         let route = match self {
             RouteConstraint::Default => return array_vec!(B),
-            RouteConstraint::ItemAny(key) | RouteConstraint::ItemPrimary(key) => match route(key) {
-                // If item cannot be routed, use default service.
-                None => return array_vec!(B),
-                // If we can pluck out a preferred primary, return it directly.
-                Some(rt) if matches!(self, RouteConstraint::ItemPrimary(..)) => {
-                    // This will be None if, eg, there is no primary (-1).
-                    if let Some(ep) = rt.endpoints.get(rt.primary as usize) {
-                        return array_vec!(B => ep.as_str());
+            RouteConstraint::ItemAny(key) | RouteConstraint::ItemPrimary(key) => {
+                match router.route(key) {
+                    // If item cannot be routed, use default service.
+                    None => return array_vec!(B),
+                    // If we can pluck out a preferred primary, return it directly.
+                    Some(rt) if matches!(self, RouteConstraint::ItemPrimary(..)) => {
+                        // This will be None if, eg, there is no primary (-1).
+                        if let Some(ep) = rt.endpoints.get(rt.primary as usize) {
+                            return array_vec!(B => ep.as_str());
+                        }
+                        rt
                     }
-                    rt
+                    Some(rt) => rt,
                 }
-                Some(rt) => rt,
-            },
+            }
             RouteConstraint::Route(rt) => *rt,
             RouteConstraint::Fixed(ep) => {
                 return array_vec!(B => *ep);
@@ -94,40 +110,42 @@ impl<'a> RouteConstraint<'a> {
 
 #[cfg(test)]
 mod test {
-    use super::{common_prefix, protocol::Route, RouteConstraint, B};
+    use super::{common_prefix, protocol::Route, RouteConstraint, Router, B};
     use serde_json::json;
     use tinyvec::array_vec;
 
     #[test]
     fn route_constraint_cases() {
-        let fixture = serde_json::from_value::<Route>(json!({
-            "members": [
-                { "zone": "aws-east1-a", "suffix": "one" },
-                { "zone": "aws-east1-b", "suffix": "two" },
-                { "zone": "gcp-west2-c", "suffix": "three" },
-            ],
-            "endpoints": ["http://one/a", "http://two/b", "http://three/c"],
-            "primary": 1,
-        }))
-        .unwrap();
-
-        let bad_fixture = serde_json::from_value::<Route>(json!({
-            "members": [
-                { "zone": "aws-east1-a", "suffix": "one" },
-                { "zone": "aws-east1-b", "suffix": "two" },
-                { "zone": "gcp-west2-c", "suffix": "three" },
-            ],
-            "endpoints": [],
-            "primary": -12345,
-        }))
-        .unwrap();
-
-        let route = |item| match item {
-            "hit" => Some(&fixture),
-            "bad" => Some(&bad_fixture),
-            "miss" => None,
-            _ => unreachable!(),
-        };
+        let route = vec![
+            (
+                "hit".to_string(),
+                serde_json::from_value::<Route>(json!({
+                    "members": [
+                        { "zone": "aws-east1-a", "suffix": "one" },
+                        { "zone": "aws-east1-b", "suffix": "two" },
+                        { "zone": "gcp-west2-c", "suffix": "three" },
+                    ],
+                    "endpoints": ["http://one/a", "http://two/b", "http://three/c"],
+                    "primary": 1,
+                }))
+                .unwrap(),
+            ),
+            (
+                "bad".to_string(),
+                serde_json::from_value::<Route>(json!({
+                    "members": [
+                        { "zone": "aws-east1-a", "suffix": "one" },
+                        { "zone": "aws-east1-b", "suffix": "two" },
+                        { "zone": "gcp-west2-c", "suffix": "three" },
+                    ],
+                    "endpoints": [],
+                    "primary": -12345,
+                }))
+                .unwrap(),
+            ),
+        ]
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
 
         assert_eq!(
             RouteConstraint::Default.pick_candidates(&route, "aws-east1-a"),
@@ -163,7 +181,7 @@ mod test {
             array_vec!(B),
         );
         // Route applies prior knowledge of the route to use.
-        let rt = RouteConstraint::Route(&fixture);
+        let rt = RouteConstraint::Route(route.route("hit").unwrap());
         assert_eq!(
             rt.pick_candidates(&route, "aws-east1-z"),
             array_vec!(B => "http://one/a", "http://two/b"),
@@ -183,7 +201,7 @@ mod test {
             RouteConstraint::ItemPrimary("bad").pick_candidates(&route, "aws-something"),
             array_vec!(B),
         );
-        let rt = RouteConstraint::Route(&bad_fixture);
+        let rt = RouteConstraint::Route(route.route("bad").unwrap());
         assert_eq!(rt.pick_candidates(&route, "gcp-something"), array_vec!(B));
     }
 
