@@ -181,7 +181,7 @@ pub struct ProcessSpec {
 }
 pub mod process_spec {
     /// ID composes a zone and a suffix to uniquely identify a ProcessSpec.
-    #[derive(Clone, PartialEq, ::prost::Message, serde::Deserialize, serde::Serialize)]
+    #[derive(Clone, PartialEq, ::prost::Message, Eq, Hash, serde::Deserialize, serde::Serialize)]
     #[serde(deny_unknown_fields)]
     pub struct Id {
         /// "Zone" in which the process is running. Zones may be AWS, Azure, or

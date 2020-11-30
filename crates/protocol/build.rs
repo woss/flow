@@ -9,6 +9,11 @@ use tonic_build;
 static SERDE_ATTR: &str =
     "#[derive(serde::Deserialize, serde::Serialize)] #[serde(deny_unknown_fields)]";
 
+// TODO(johnny): Ideally we'd have HASH_ATTR and use concat! below,
+// but that doesn't work with const identifiers (only literals).
+static SERDE_AND_HASH_ATTR: &str =
+    "#[derive(Eq, Hash, serde::Deserialize, serde::Serialize)] #[serde(deny_unknown_fields)]";
+
 // This is a hack to allow our prost Message types impl De/Serialize. We ought to be able to
 // remove this once: https://github.com/danburkert/prost/issues/277 is merged, as that will
 // allow us to use something like this: https://github.com/fdeantoni/prost-wkt to make the
@@ -44,7 +49,7 @@ static TYPE_ATTRS: &'static [TypeAttrs<'static>] = &[
     },
     TypeAttrs {
         path: "protocol.ProcessSpec.ID",
-        type_attrs: SERDE_ATTR,
+        type_attrs: SERDE_AND_HASH_ATTR,
         field_attrs: &[],
     },
     TypeAttrs {
