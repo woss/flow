@@ -515,7 +515,7 @@ async fn do_the_thing(index: usize, dispatcher: Arc<Mutex<Dispatcher<HashMapRout
             }),
         })
         .await
-        .expect("no failure");
+        .expect("failed to list journals");
 
     let resp = resp.into_inner();
 
@@ -537,27 +537,16 @@ async fn do_the_thing(index: usize, dispatcher: Arc<Mutex<Dispatcher<HashMapRout
 
     let journal = "recovery/derivation/stock/daily-stats/00-0000000000000000".to_string();
 
-    let constraint = Constraint::ItemPrimary(&journal);
-    let binding = constraint.query(dispatcher.clone()).await.unwrap();
-    let mut jc = protocol::journal_client::JournalClient::new(binding);
-
-    let v1 = protocol::AppendRequest {
-        journal,
-        ..Default::default()
-    };
-    let v2 = protocol::AppendRequest {
-        content: b"hello, world".to_vec(),
-        ..Default::default()
-    };
-    let v3 = protocol::AppendRequest {
-        ..Default::default()
-    };
-
-    let resp = jc
-        .append(futures::stream::iter(vec![v1, v2, v3]))
-        .await
-        .unwrap()
-        .into_inner();
+    let resp = crate::append::append(
+        dispatcher,
+        protocol::AppendRequest {
+            journal,
+            ..Default::default()
+        },
+        futures::stream::once(async { b"hello, world".to_vec() }),
+    )
+    .await
+    .unwrap();
 
     tracing::info!(?resp, "got append response");
 }
@@ -594,7 +583,7 @@ mod tests {
         let h2 = tokio::spawn(do_the_thing(2, dispatcher.clone()));
         let h3 = tokio::spawn(do_the_thing(3, dispatcher.clone()));
 
-        let r = futures::try_join!(h1, h2, h3);
-        tracing::info!(response = ?r, "all done");
+        let r = futures::try_join!(h1, h2, h3).unwrap();
+        tracing::info!(?r, "all done");
     }
 }

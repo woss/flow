@@ -1,37 +1,44 @@
-/*
-use crate::dispatch::{Dispatcher, Error};
-use crate::route_constraint::{ItemRouter, RouteConstraint};
+use crate::dispatch::{Constraint, Dispatcher, Error as DispatchError, Router};
+use ::protocol::protocol::{self as broker, journal_client::JournalClient};
+use broker::AppendRequest;
 use futures::stream::{Stream, StreamExt};
-use protocol::protocol::{self as broker, journal_client::JournalClient};
+use std::fs::File as StdFile;
 use std::sync::{Arc, Mutex};
 
+struct PendingAppend {
+    fb: StdFile,
+}
 
-pub async fn append<J, S, R>(
+pub async fn append<S, R>(
     dispatcher: Arc<Mutex<Dispatcher<R>>>,
-    journal: J,
+    request: broker::AppendRequest,
     data: S,
-) -> Result<broker::AppendResponse, Error>
+) -> Result<broker::AppendResponse, DispatchError>
 where
-    J: Into<String>,
-    S: Stream,
+    S: Stream + Send + Sync + 'static,
     S::Item: Into<Vec<u8>>,
-    R: ItemRouter + Send + 'static,
+    R: Router + Send + 'static,
 {
-    let journal = journal.into();
-    let constraint = RouteConstraint::ItemPrimary(&journal);
-    let binding = Dispatcher::bind(dispatcher, constraint);
-    let mut _jc = JournalClient::new(binding);
+    let constraint = Constraint::ItemPrimary(&request.journal);
+    let binding = constraint.query(dispatcher).await.unwrap();
+    let mut jc = JournalClient::new(binding);
+
+    let s = futures::stream::once(async move { request })
+        .chain(data.map(|d| AppendRequest {
+            content: d.into(),
+            ..Default::default()
+        }))
+        .chain(futures::stream::once(async { AppendRequest::default() }));
+
+    let resp = jc.append(s).await?.into_inner();
 
     /*
-
-    data.map(|chunk| broker::AppendRequest{
-
-
-    })
-
-    jc.append(request)
+    if let Some(h) = resp.header.as_mut() {
+        if let Some(route) = h.route.take() {
+            let r = dispatcher.lock().unwrap().router().observe_route(h.route.take());
+        }
+    }
     */
 
-    Ok(broker::AppendResponse::default())
+    Ok(resp)
 }
-*/
