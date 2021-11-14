@@ -63,7 +63,7 @@ func (s *connectorStore) restoreCheckpoint(shard consumer.Shard) (cp pgc.Checkpo
 func (s *connectorStore) updateDriverCheckpoint(next json.RawMessage, patch bool) {
 	if len(next) == 0 {
 		// A nil RawMessage is encoded as JSON null, and a non-nil but empty RawMessage
-		// is an encoding error. Canonicalize to the former.
+		// is an encoding error. Canonical-ize to the former.
 		next = nil
 	}
 

@@ -343,14 +343,15 @@ pub struct CaptureSpec {
 /// Nested message and enum types in `CaptureSpec`.
 pub mod capture_spec {
     /// Bindings of endpoint resources and collections into which they're captured.
-    /// Bindings are ordered and unique on the bound collection name.
+    /// Bindings are ordered and unique on the bound collection name,
+    /// and are also unique on the resource path.
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct Binding {
         /// JSON-encoded object which specifies the endpoint resource to be captured.
         #[prost(string, tag="1")]
         pub resource_spec_json: ::prost::alloc::string::String,
         /// Driver-supplied path components which fully qualify the
-        /// subresource being materialized.
+        /// subresource being captured.
         #[prost(string, repeated, tag="2")]
         pub resource_path: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
         /// Collection to be captured into.
@@ -386,7 +387,8 @@ pub struct MaterializationSpec {
 /// Nested message and enum types in `MaterializationSpec`.
 pub mod materialization_spec {
     /// Bindings of endpoint resources and collections from which they're
-    /// materialized. Bindings are ordered and unique on the bound collection name.
+    /// materialized. Bindings are ordered and unique on the bound collection name,
+    /// and are also unique on the resource path.
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct Binding {
         /// JSON-encoded object which specifies the endpoint resource to be
@@ -908,12 +910,14 @@ pub enum EndpointType {
     /// Reserved for REMOTE gRPC servers if there's ever a use case.
     Invalid = 0,
     Sqlite = 2,
+    Ingest = 3,
     AirbyteSource = 7,
     FlowSink = 8,
 }
-/// LogLevelFilter is a common representation of a simple logging filter, which is shared between
-/// Rust and Go code. This enum is not used directly within other messages here because logging is
-/// configured at the time that Rust Service instances are created, not when they're configured.
+/// LogLevelFilter is a common representation of a simple logging filter, which
+/// is shared between Rust and Go code. This enum is not used directly within
+/// other messages here because logging is configured at the time that Rust
+/// Service instances are created, not when they're configured.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum LogLevelFilter {

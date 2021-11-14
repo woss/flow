@@ -1,5 +1,11 @@
 package materialize
 
+// TODO(johnny): While they started a bit different, over time this file and
+// go/capture/adapter.go now look essentially identical in terms of
+// structure. They do differ on interfaces, however, making re-use a challenge.
+// If contemplating a change here, make it there as well.
+// And when generally available, consider using Go generics ?
+
 import (
 	"context"
 	"io"
@@ -9,13 +15,13 @@ import (
 	"google.golang.org/grpc/metadata"
 )
 
-// transactionRequest is a channel-oriented wrapper of pf.transactionRequest.
+// transactionRequest is a channel-oriented wrapper of pm.TransactionRequest.
 type transactionRequest struct {
 	*pm.TransactionRequest
 	Error error
 }
 
-// TransactionResponse is a channel-oriented wrapper of pf.TransactionResponse.
+// TransactionResponse is a channel-oriented wrapper of pm.TransactionResponse.
 type TransactionResponse struct {
 	*pm.TransactionResponse
 	Error error
@@ -96,8 +102,12 @@ func (a adapter) Validate(ctx context.Context, in *pm.ValidateRequest, opts ...g
 	return a.DriverServer.Validate(ctx, in)
 }
 
-func (a adapter) Apply(ctx context.Context, in *pm.ApplyRequest, opts ...grpc.CallOption) (*pm.ApplyResponse, error) {
-	return a.DriverServer.Apply(ctx, in)
+func (a adapter) ApplyUpsert(ctx context.Context, in *pm.ApplyRequest, opts ...grpc.CallOption) (*pm.ApplyResponse, error) {
+	return a.DriverServer.ApplyUpsert(ctx, in)
+}
+
+func (a adapter) ApplyDelete(ctx context.Context, in *pm.ApplyRequest, opts ...grpc.CallOption) (*pm.ApplyResponse, error) {
+	return a.DriverServer.ApplyDelete(ctx, in)
 }
 
 func (a adapter) Transactions(ctx context.Context, opts ...grpc.CallOption) (pm.Driver_TransactionsClient, error) {

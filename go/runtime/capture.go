@@ -24,12 +24,18 @@ import (
 
 // Capture is a top-level Application which implements the capture workflow.
 type Capture struct {
-	// FlowConsumer which owns this Capture shard.
-	host *FlowConsumer
-	// Store delegate for persisting local checkpoints.
-	store connectorStore
 	// Active capture specification, updated in RestoreCheckpoint.
 	capture *pf.CaptureSpec
+	// FlowConsumer which owns this Capture shard.
+	host *FlowConsumer
+	// Driver responses, pumped through a concurrent read loop.
+	// Updated in RestoreCheckpoint.
+	driverRx <-chan capture.PullResponse
+	// Driver requests.
+	// Updated in RestoreCheckpoint.
+	driverTx pc.Driver_PullClient
+	// Store delegate for persisting local checkpoints.
+	store connectorStore
 	// Embedded processing state scoped to a current task version.
 	// Updated in RestoreCheckpoint.
 	taskTerm
@@ -121,7 +127,7 @@ func (c *Capture) StartReadingMessages(shard consumer.Shard, cp pf.Checkpoint,
 	go c.serveDriverTransactions(ctx, shard.FQN(), time.NewTimer(interval).C, cp, driverRx, ch)
 }
 
-func (c *Capture) openCapture(ctx context.Context) (<-chan capture.CaptureResponse, error) {
+func (c *Capture) openCapture(ctx context.Context) (<-chan capture.PullResponse, error) {
 	conn, err := capture.NewDriver(ctx,
 		c.capture.EndpointType,
 		c.capture.EndpointSpecJson,
@@ -132,17 +138,22 @@ func (c *Capture) openCapture(ctx context.Context) (<-chan capture.CaptureRespon
 		return nil, fmt.Errorf("building endpoint driver: %w", err)
 	}
 
-	driverStream, err := conn.Capture(ctx, &pc.CaptureRequest{
-		Capture:              c.capture,
-		KeyBegin:             c.labels.Range.KeyBegin,
-		KeyEnd:               c.labels.Range.KeyEnd,
-		DriverCheckpointJson: c.store.driverCheckpoint(),
-		Tail:                 !c.host.Config.Flow.Poll,
-	})
+	driverStream, err := conn.Pull(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("driver.Capture: %w", err)
+		return nil, fmt.Errorf("driver.Pull: %w", err)
 	}
-	var driverRx = capture.CaptureResponseChannel(driverStream)
+	var driverRx = capture.PullResponseChannel(driverStream)
+
+	if err = driverStream.Send(&pc.PullRequest{
+		Open: &pc.PullRequest_Open{
+			Capture:              c.capture,
+			KeyBegin:             c.labels.Range.KeyBegin,
+			KeyEnd:               c.labels.Range.KeyEnd,
+			DriverCheckpointJson: c.store.driverCheckpoint(),
+			Tail:                 !c.host.Config.Flow.Poll,
+		}}); err != nil {
+		return nil, fmt.Errorf("sending Open: %w", err)
+	}
 
 	if opened, err := capture.Rx(driverRx, true); err != nil {
 		return nil, fmt.Errorf("reading Opened: %w", err)
